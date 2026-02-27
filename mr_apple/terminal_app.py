@@ -76,7 +76,7 @@ class _CommandCompleter:
                     if item.startswith(text)
                 ]
         if command == "/mcp":
-            subs = ["status", "tools", "reload"]
+            subs = ["status", "tools", "servers", "add", "remove", "reload"]
             return [item for item in subs if item.startswith(text)]
         return []
 
@@ -135,7 +135,7 @@ class MrAppleTerminalApp:
         print("- /save [path]           Save transcript JSON (default: transcript.json)")
         print("- /reset                 Start a new empty model session")
         print("- /session ...           Manage named sessions (list/save/load/name)")
-        print("- /mcp ...               MCP status/tools/reload")
+        print("- /mcp ...               MCP status/tools/servers/add/remove/reload")
         print("- /exit                  Exit terminal")
         print("- !<shell command>       Execute shell command directly")
         print("")
@@ -416,6 +416,12 @@ class MrAppleTerminalApp:
             return
 
         sub = parts[1].lower()
+        if sub in {"servers", "list"}:
+            print(f"mcp> config={self.runtime.mcp_config_path_display()}")
+            for line in self.runtime.list_configured_mcp_servers():
+                print(f"- {line}")
+            return
+
         if sub == "tools":
             tools = self.runtime.mcp_tool_lines()
             if not tools:
@@ -434,7 +440,38 @@ class MrAppleTerminalApp:
                 print(f"error> {exc}")
             return
 
-        print("error> usage: /mcp [status|tools|reload]")
+        if sub == "add":
+            if len(parts) < 4:
+                print("error> usage: /mcp add <name> <command> [args...]")
+                return
+            name = parts[2]
+            command = parts[3]
+            args = parts[4:] if len(parts) > 4 else []
+            try:
+                path = self.runtime.add_or_update_mcp_server(name, command, args)
+                await self.runtime.reload_mcp()
+                print(f"mcp> server '{name}' saved to {path} and reloaded")
+            except Exception as exc:
+                print(f"error> {exc}")
+            return
+
+        if sub == "remove":
+            if len(parts) < 3:
+                print("error> usage: /mcp remove <name>")
+                return
+            name = parts[2]
+            try:
+                path, existed = self.runtime.remove_mcp_server(name)
+                if not existed:
+                    print(f"mcp> server '{name}' not found in {path}")
+                    return
+                await self.runtime.reload_mcp()
+                print(f"mcp> server '{name}' removed from {path} and reloaded")
+            except Exception as exc:
+                print(f"error> {exc}")
+            return
+
+        print("error> usage: /mcp [status|tools|servers|add|remove|reload]")
 
 
 async def run_cli(runtime: MrAppleSession) -> None:

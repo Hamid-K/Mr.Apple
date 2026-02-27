@@ -858,6 +858,7 @@ def parse_toggle(value: str) -> Optional[bool]:
 
 
 _SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 def normalize_session_name(name: str) -> str:
@@ -884,6 +885,17 @@ def _session_history_from_payload(payload: dict[str, Any]) -> list[dict[str, str
         if not isinstance(user, str) or not isinstance(assistant, str):
             continue
         cleaned.append({"user": user, "assistant": assistant})
+    return cleaned
+
+
+def _normalize_mcp_server_name(name: str) -> str:
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("MCP server name cannot be empty")
+    if not _MCP_SERVER_NAME_RE.match(cleaned):
+        raise ValueError(
+            "MCP server name must match [A-Za-z0-9._-] and be at most 128 chars"
+        )
     return cleaned
 
 
@@ -1053,6 +1065,104 @@ class MrAppleSession:
         normalized = normalize_session_name(name)
         self.session_name = normalized
         return normalized
+
+    def mcp_config_path_display(self) -> Path:
+        if self.mcp_config_path:
+            return self.mcp_config_path
+        return self.context.workspace_root / ".mr_apple" / "mcp_servers.json"
+
+    def _load_mcp_config_payload(
+        self, *, create_if_missing: bool = False
+    ) -> tuple[Path, dict[str, Any]]:
+        config_path = self.mcp_config_path_display().expanduser().resolve()
+        self.mcp_config_path = config_path
+
+        if not config_path.exists():
+            if create_if_missing:
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                payload: dict[str, Any] = {"mcpServers": {}}
+                config_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                return config_path, payload
+            return config_path, {"mcpServers": {}}
+
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"invalid MCP config JSON in {config_path}")
+        servers = payload.get("mcpServers")
+        if servers is None:
+            payload["mcpServers"] = {}
+        elif not isinstance(servers, dict):
+            raise ValueError(f"invalid MCP config: 'mcpServers' must be an object")
+        return config_path, payload
+
+    def _write_mcp_config_payload(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def list_configured_mcp_servers(self) -> list[str]:
+        path, payload = self._load_mcp_config_payload(create_if_missing=False)
+        servers = payload.get("mcpServers", {})
+        if not isinstance(servers, dict):
+            return []
+
+        lines: list[str] = []
+        for server_name in sorted(servers.keys()):
+            spec = servers.get(server_name)
+            if not isinstance(spec, dict):
+                continue
+            command = str(spec.get("command", "")).strip()
+            args = spec.get("args", [])
+            if not isinstance(args, list):
+                args = []
+            arg_text = " ".join(str(item) for item in args)
+            disabled = bool(spec.get("disabled", False))
+            disabled_suffix = " [disabled]" if disabled else ""
+            preview = f"{command} {arg_text}".strip()
+            lines.append(f"{server_name}: {preview}{disabled_suffix}".strip())
+
+        if not lines:
+            lines.append(f"(no servers) config={path}")
+        return lines
+
+    def add_or_update_mcp_server(
+        self,
+        name: str,
+        command: str,
+        args: list[str],
+    ) -> Path:
+        server_name = _normalize_mcp_server_name(name)
+        command_clean = command.strip()
+        if not command_clean:
+            raise ValueError("MCP server command cannot be empty")
+
+        path, payload = self._load_mcp_config_payload(create_if_missing=True)
+        servers = payload.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise ValueError("invalid MCP config: 'mcpServers' must be an object")
+        servers[server_name] = {
+            "command": command_clean,
+            "args": [str(item) for item in args],
+        }
+        self._write_mcp_config_payload(path, payload)
+        return path
+
+    def remove_mcp_server(self, name: str) -> tuple[Path, bool]:
+        server_name = _normalize_mcp_server_name(name)
+        path, payload = self._load_mcp_config_payload(create_if_missing=True)
+        servers = payload.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise ValueError("invalid MCP config: 'mcpServers' must be an object")
+        existed = server_name in servers
+        if existed:
+            del servers[server_name]
+            self._write_mcp_config_payload(path, payload)
+        return path, existed
 
     async def _ensure_mcp_manager(self) -> None:
         if not self.mcp_config_path:

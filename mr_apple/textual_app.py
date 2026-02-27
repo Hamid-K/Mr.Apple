@@ -5,7 +5,7 @@ import shlex
 import apple_fm_sdk as fm
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Header, Input, RichLog, Static
+from textual.widgets import Header, Input, Static, TextArea
 
 from .core import MrAppleSession, parse_toggle
 
@@ -37,8 +37,9 @@ class MrAppleTextualApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit"),
+        Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "clear_log", "Clear Log"),
+        Binding("ctrl+shift+c", "copy_selection", "Copy"),
         Binding("tab", "autocomplete", "Autocomplete"),
     ]
 
@@ -70,7 +71,7 @@ class MrAppleTextualApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Static("starting...", id="status")
-        yield RichLog(id="log", wrap=True, markup=True)
+        yield TextArea("", id="log", soft_wrap=True, read_only=True, show_line_numbers=False)
         yield Input(placeholder="Type prompt, /command, or !shell", id="input")
 
     async def on_mount(self) -> None:
@@ -93,17 +94,28 @@ class MrAppleTextualApp(App[None]):
         self.runtime.status.set_stream(self.runtime.stream_mode)
         self.query_one("#status", Static).update(self.runtime.status.line())
 
+    def _scroll_log_to_end(self) -> None:
+        log = self.query_one("#log", TextArea)
+        last_line = max(0, log.document.line_count - 1)
+        last_col = len(log.document.get_line(last_line))
+        log.move_cursor((last_line, last_col), center=False)
+
     def _log(self, text: str) -> None:
-        self.query_one("#log", RichLog).write(text)
+        log = self.query_one("#log", TextArea)
+        if log.text:
+            log.load_text(f"{log.text}\n{text}")
+        else:
+            log.load_text(text)
+        self._scroll_log_to_end()
 
     def _log_info(self, text: str) -> None:
-        self._log(f"[cyan]info>[/cyan] {text}")
+        self._log(f"info> {text}")
 
     def _log_error(self, text: str) -> None:
-        self._log(f"[red]error>[/red] {text}")
+        self._log(f"error> {text}")
 
     def _log_event(self, text: str) -> None:
-        self._log(f"[yellow]{text}[/yellow]")
+        self._log(text)
 
     def _suggest_completions(self, line: str) -> list[str]:
         stripped = line.strip()
@@ -132,7 +144,7 @@ class MrAppleTextualApp(App[None]):
             if len(parts) >= 2 and parts[1] in {"load", "resume"}:
                 return self.runtime.list_saved_sessions()
         if command == "/mcp":
-            return ["status", "tools", "reload"]
+            return ["status", "tools", "servers", "add", "remove", "reload"]
         return []
 
     def action_autocomplete(self) -> None:
@@ -180,10 +192,10 @@ class MrAppleTextualApp(App[None]):
         await self._handle_prompt(text)
 
     async def _handle_prompt(self, text: str) -> None:
-        self._log(f"[bold cyan]you>[/bold cyan] {text}")
+        self._log(f"you> {text}")
         try:
             response = await self.runtime.respond(text)
-            self._log(f"[bold green]assistant>[/bold green] {response}")
+            self._log(f"assistant> {response}")
             self._refresh_status_widget()
         except fm.FoundationModelsError as exc:
             self._refresh_status_widget()
@@ -202,10 +214,8 @@ class MrAppleTextualApp(App[None]):
             if result["stdout"]:
                 self._log(result["stdout"].rstrip("\n"))
             if result["stderr"]:
-                self._log(f"[red]{result['stderr'].rstrip()}[/red]")
-            self._log(
-                f"[magenta][exit={result['exit_code']} timed_out={result['timed_out']}][/magenta]"
-            )
+                self._log(result["stderr"].rstrip())
+            self._log(f"[exit={result['exit_code']} timed_out={result['timed_out']}]")
         except Exception as exc:
             self._log_error(f"command execution failed: {exc}")
 
@@ -228,7 +238,8 @@ class MrAppleTextualApp(App[None]):
             self._log(
                 "Commands: /help /mode [chat|agent] /trace [on|off] /showcase \"prompt\" "
                 "/stream [on|off] /tools /cwd [path] /save [path] /reset "
-                "/session [list|name|save|load|resume] /mcp [status|tools|reload] "
+                "/session [list|name|save|load|resume] "
+                "/mcp [status|tools|servers|add|remove|reload] "
                 "/exit and !<shell>"
             )
             return
@@ -331,9 +342,9 @@ class MrAppleTextualApp(App[None]):
         for mode in ("chat", "agent"):
             self.runtime.set_mode(mode)
             await self.runtime.reset_session(clear_saved_context=True)
-            self._log(f"[magenta]----- showcase mode={mode} -----[/magenta]")
+            self._log(f"----- showcase mode={mode} -----")
             await self._handle_prompt(prompt)
-            self._log(f"[magenta]----- end mode={mode} -----[/magenta]")
+            self._log(f"----- end mode={mode} -----")
 
         self.runtime.set_mode(original_mode)
         self.runtime.set_stream_mode(original_stream)
@@ -398,6 +409,12 @@ class MrAppleTextualApp(App[None]):
             return
 
         sub = parts[1].lower()
+        if sub in {"servers", "list"}:
+            self._log(f"mcp> config={self.runtime.mcp_config_path_display()}")
+            for line in self.runtime.list_configured_mcp_servers():
+                self._log(f"- {line}")
+            return
+
         if sub == "tools":
             tools = self.runtime.mcp_tool_lines()
             if not tools:
@@ -417,11 +434,49 @@ class MrAppleTextualApp(App[None]):
                 self._log_error(str(exc))
             return
 
-        self._log_error("usage: /mcp [status|tools|reload]")
+        if sub == "add":
+            if len(parts) < 4:
+                self._log_error("usage: /mcp add <name> <command> [args...]")
+                return
+            name = parts[2]
+            command = parts[3]
+            args = parts[4:] if len(parts) > 4 else []
+            try:
+                path = self.runtime.add_or_update_mcp_server(name, command, args)
+                await self.runtime.reload_mcp()
+                self._log_info(f"mcp server '{name}' saved to {path} and reloaded")
+                self._refresh_status_widget()
+            except Exception as exc:
+                self._log_error(str(exc))
+            return
+
+        if sub == "remove":
+            if len(parts) < 3:
+                self._log_error("usage: /mcp remove <name>")
+                return
+            name = parts[2]
+            try:
+                path, existed = self.runtime.remove_mcp_server(name)
+                if not existed:
+                    self._log_info(f"mcp server '{name}' not found in {path}")
+                    return
+                await self.runtime.reload_mcp()
+                self._log_info(f"mcp server '{name}' removed from {path} and reloaded")
+                self._refresh_status_widget()
+            except Exception as exc:
+                self._log_error(str(exc))
+            return
+
+        self._log_error("usage: /mcp [status|tools|servers|add|remove|reload]")
 
     def action_clear_log(self) -> None:
-        self.query_one("#log", RichLog).clear()
+        self.query_one("#log", TextArea).load_text("")
         self._log_info("log cleared")
+
+    def action_copy_selection(self) -> None:
+        focused = self.focused
+        if isinstance(focused, TextArea):
+            focused.action_copy()
 
 
 def run_textual(runtime: MrAppleSession) -> None:

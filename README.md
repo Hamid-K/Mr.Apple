@@ -129,6 +129,9 @@ If `--mcp-config` is omitted, `Mr.Apple` auto-loads:
 - `/session save [name]` save named session
 - `/session load <name>` resume named session
 - `/mcp status` show MCP server status
+- `/mcp servers` list configured MCP servers from config
+- `/mcp add <name> <command> [args...]` add/update an MCP server in config and reload
+- `/mcp remove <name>` remove MCP server from config and reload
 - `/mcp tools` list loaded MCP tools
 - `/mcp reload` reload MCP config and rebuild tool set
 - `/exit` quit
