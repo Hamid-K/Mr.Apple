@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import shlex
 
 import apple_fm_sdk as fm
@@ -40,6 +39,24 @@ class MrAppleTextualApp(App[None]):
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
         Binding("ctrl+l", "clear_log", "Clear Log"),
+        Binding("tab", "autocomplete", "Autocomplete"),
+    ]
+
+    COMMANDS = [
+        "/help",
+        "/mode",
+        "/trace",
+        "/showcase",
+        "/tools",
+        "/stream",
+        "/cwd",
+        "/save",
+        "/transcript",
+        "/reset",
+        "/session",
+        "/mcp",
+        "/exit",
+        "/quit",
     ]
 
     def __init__(self, runtime: MrAppleSession) -> None:
@@ -57,11 +74,13 @@ class MrAppleTextualApp(App[None]):
         yield Input(placeholder="Type prompt, /command, or !shell", id="input")
 
     async def on_mount(self) -> None:
-        await self.runtime.initialize_session()
-        await self.runtime.refresh_context_usage()
+        await self.runtime.start()
         self._refresh_status_widget()
         self._log_info("Ready. Default mode is chat. Use /help for commands.")
         self.query_one("#input", Input).focus()
+
+    async def on_unmount(self) -> None:
+        await self.runtime.shutdown()
 
     def _status_tick(self) -> None:
         self.call_later(self._refresh_status_widget)
@@ -85,6 +104,58 @@ class MrAppleTextualApp(App[None]):
 
     def _log_event(self, text: str) -> None:
         self._log(f"[yellow]{text}[/yellow]")
+
+    def _suggest_completions(self, line: str) -> list[str]:
+        stripped = line.strip()
+        if not stripped.startswith("/"):
+            return []
+
+        try:
+            parts = shlex.split(stripped)
+        except Exception:
+            parts = stripped.split()
+
+        if not parts:
+            return self.COMMANDS
+
+        if len(parts) == 1 and not stripped.endswith(" "):
+            return [item for item in self.COMMANDS if item.startswith(parts[0])]
+
+        command = parts[0]
+        if command == "/mode":
+            return ["chat", "agent"]
+        if command in {"/stream", "/trace"}:
+            return ["on", "off"]
+        if command == "/session":
+            if len(parts) <= 2 and not stripped.endswith(" "):
+                return ["list", "save", "load", "resume", "name"]
+            if len(parts) >= 2 and parts[1] in {"load", "resume"}:
+                return self.runtime.list_saved_sessions()
+        if command == "/mcp":
+            return ["status", "tools", "reload"]
+        return []
+
+    def action_autocomplete(self) -> None:
+        input_widget = self.query_one("#input", Input)
+        value = input_widget.value
+        candidates = self._suggest_completions(value)
+        if not candidates:
+            return
+
+        if value.strip() == "":
+            return
+
+        prefix = value.split()[-1] if value.split() else value
+        match = next((item for item in candidates if item.startswith(prefix)), None)
+        if match is None:
+            return
+
+        if " " in value.strip():
+            idx = value.rfind(prefix)
+            input_widget.value = f"{value[:idx]}{match}"
+        else:
+            input_widget.value = match
+        input_widget.cursor_position = len(input_widget.value)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -154,7 +225,9 @@ class MrAppleTextualApp(App[None]):
         if command == "/help":
             self._log(
                 "Commands: /help /mode [chat|agent] /trace [on|off] /showcase \"prompt\" "
-                "/stream [on|off] /tools /cwd [path] /save [path] /reset /exit and !<shell>"
+                "/stream [on|off] /tools /cwd [path] /save [path] /reset "
+                "/session [list|name|save|load|resume] /mcp [status|tools|reload] "
+                "/exit and !<shell>"
             )
             return
 
@@ -223,13 +296,21 @@ class MrAppleTextualApp(App[None]):
             return
 
         if command == "/reset":
-            await self.runtime.reset_session()
+            await self.runtime.reset_session(clear_saved_context=True)
             self._log_info("started a new session (context reset)")
             self._refresh_status_widget()
             return
 
         if command == "/showcase":
             await self._command_showcase(parts)
+            return
+
+        if command == "/session":
+            await self._command_session(parts)
+            return
+
+        if command == "/mcp":
+            await self._command_mcp(parts)
             return
 
         self._log_error(f"unknown command '{command}'. Type /help.")
@@ -247,16 +328,94 @@ class MrAppleTextualApp(App[None]):
         self.runtime.set_stream_mode(True)
         for mode in ("chat", "agent"):
             self.runtime.set_mode(mode)
-            await self.runtime.reset_session()
+            await self.runtime.reset_session(clear_saved_context=True)
             self._log(f"[magenta]----- showcase mode={mode} -----[/magenta]")
             await self._handle_prompt(prompt)
             self._log(f"[magenta]----- end mode={mode} -----[/magenta]")
 
         self.runtime.set_mode(original_mode)
         self.runtime.set_stream_mode(original_stream)
-        await self.runtime.reset_session()
+        await self.runtime.reset_session(clear_saved_context=True)
         self._refresh_status_widget()
         self._log_info("showcase complete")
+
+    async def _command_session(self, parts: list[str]) -> None:
+        if len(parts) == 1:
+            self._log_info(f"session {self.runtime.session_summary()}")
+            return
+
+        sub = parts[1].lower()
+        if sub == "list":
+            sessions = self.runtime.list_saved_sessions()
+            if not sessions:
+                self._log_info("no saved sessions")
+                return
+            self._log("Saved sessions:")
+            for name in sessions:
+                self._log(f"- {name}")
+            return
+
+        if sub == "name":
+            if len(parts) < 3:
+                self._log_error("usage: /session name <name>")
+                return
+            try:
+                assigned = self.runtime.set_session_name(parts[2])
+                self._log_info(f"active session name set to {assigned}")
+            except Exception as exc:
+                self._log_error(str(exc))
+            return
+
+        if sub == "save":
+            name = parts[2] if len(parts) > 2 else None
+            try:
+                saved = await self.runtime.save_named_session(name)
+                self._log_info(f"session saved to {saved}")
+            except Exception as exc:
+                self._log_error(str(exc))
+            return
+
+        if sub in {"load", "resume"}:
+            if len(parts) < 3:
+                self._log_error("usage: /session load <name>")
+                return
+            try:
+                loaded = await self.runtime.load_named_session(parts[2])
+                self._log_info(f"resumed session from {loaded}")
+                self._refresh_status_widget()
+            except Exception as exc:
+                self._log_error(str(exc))
+            return
+
+        self._log_error("usage: /session [list|name|save|load|resume]")
+
+    async def _command_mcp(self, parts: list[str]) -> None:
+        if len(parts) == 1 or parts[1].lower() == "status":
+            for line in self.runtime.mcp_server_status_lines():
+                self._log(f"mcp> {line}")
+            return
+
+        sub = parts[1].lower()
+        if sub == "tools":
+            tools = self.runtime.mcp_tool_lines()
+            if not tools:
+                self._log("mcp> no MCP tools loaded")
+                return
+            self._log("MCP tools:")
+            for line in tools:
+                self._log(f"- {line}")
+            return
+
+        if sub == "reload":
+            try:
+                await self.runtime.reload_mcp()
+                self._log_info("reloaded MCP servers and reset current model session")
+                self._refresh_status_widget()
+            except Exception as exc:
+                self._log_error(str(exc))
+            return
+
+        self._log_error("usage: /mcp [status|tools|reload]")
 
     def action_clear_log(self) -> None:
         self.query_one("#log", RichLog).clear()

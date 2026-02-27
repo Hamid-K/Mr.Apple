@@ -4,9 +4,12 @@ import asyncio
 import json
 import re
 import shutil
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from .mcp import MCPManager, MCPToolDescriptor
 
 try:
     import apple_fm_sdk as fm
@@ -27,6 +30,7 @@ DEFAULT_MAX_LIST_ENTRIES = 200
 DEFAULT_MAX_SEARCH_MATCHES = 100
 DEFAULT_MAX_SUBAGENTS = 4
 DEFAULT_CONTEXT_WINDOW_CHARS = 120_000
+DEFAULT_MAX_RESUME_TURNS = 24
 
 
 @dataclass
@@ -726,9 +730,11 @@ class SpawnSubagentsTool(WorkspaceToolBase):
         context: ToolRuntimeContext,
         model: fm.SystemLanguageModel,
         base_instructions: str,
+        extra_tools_factory: Optional[Callable[[], list[fm.Tool]]] = None,
     ):
         self.model = model
         self.base_instructions = base_instructions
+        self.extra_tools_factory = extra_tools_factory
         super().__init__(context)
 
     @property
@@ -755,6 +761,8 @@ class SpawnSubagentsTool(WorkspaceToolBase):
                     ListFilesTool(self.context),
                     SearchFilesTool(self.context),
                 ]
+                if self.extra_tools_factory:
+                    sub_tools.extend(self.extra_tools_factory())
                 sub_session = fm.LanguageModelSession(
                     instructions=(
                         f"{self.base_instructions}\n\n"
@@ -848,6 +856,109 @@ def parse_toggle(value: str) -> Optional[bool]:
     return None
 
 
+_SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def normalize_session_name(name: str) -> str:
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("session name cannot be empty")
+    if not _SESSION_NAME_RE.match(cleaned):
+        raise ValueError(
+            "session name must match [A-Za-z0-9._-] and be at most 64 chars"
+        )
+    return cleaned
+
+
+def _session_history_from_payload(payload: dict[str, Any]) -> list[dict[str, str]]:
+    history = payload.get("history")
+    if not isinstance(history, list):
+        return []
+    cleaned: list[dict[str, str]] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        user = entry.get("user")
+        assistant = entry.get("assistant")
+        if not isinstance(user, str) or not isinstance(assistant, str):
+            continue
+        cleaned.append({"user": user, "assistant": assistant})
+    return cleaned
+
+
+@fm.generable("Arguments for calling an MCP tool through JSON arguments.")
+class MCPToolCallArgs:
+    arguments_json: Optional[str] = fm.guide(
+        "JSON object string with arguments for the MCP tool. Use '{}' when there are no arguments."
+    )
+
+
+class MCPProxyTool(WorkspaceToolBase):
+    def __init__(
+        self,
+        context: ToolRuntimeContext,
+        mcp_manager: MCPManager,
+        descriptor: MCPToolDescriptor,
+    ):
+        self.mcp_manager = mcp_manager
+        self.descriptor = descriptor
+        self.name = descriptor.full_name
+
+        schema_preview = json.dumps(descriptor.input_schema, ensure_ascii=False)
+        schema_preview, schema_truncated = _truncate(schema_preview, 500)
+        if schema_truncated:
+            schema_preview = f"{schema_preview}…"
+        base_desc = descriptor.description or "MCP tool"
+        self.description = (
+            f"[MCP:{descriptor.server_name}] {base_desc}. "
+            f"Provide arguments_json matching schema: {schema_preview}"
+        )
+        super().__init__(context)
+
+    @property
+    def arguments_schema(self) -> fm.GenerationSchema:
+        return MCPToolCallArgs.generation_schema()
+
+    async def call(self, args: fm.GeneratedContent) -> str:
+        raw_args = args.value(Optional[str], for_property="arguments_json")
+        self.tool_started(self.name)
+
+        try:
+            if raw_args and raw_args.strip():
+                parsed = json.loads(raw_args)
+            else:
+                parsed = {}
+            if not isinstance(parsed, dict):
+                self.tool_finished(self.name, ok=False)
+                return self.as_json(
+                    {"error": "arguments_json must decode to a JSON object"}
+                )
+
+            self.emit(
+                f"tool> {self.name} start server={self.descriptor.server_name} "
+                f"tool={self.descriptor.tool_name}"
+            )
+            result = await self.mcp_manager.call_tool(self.name, parsed)
+            is_error = bool(result.get("isError")) if isinstance(result, dict) else False
+            self.emit(
+                f"tool> {self.name} done server={self.descriptor.server_name} "
+                f"tool={self.descriptor.tool_name} is_error={is_error}"
+            )
+            self.tool_finished(self.name, ok=not is_error)
+            return self.as_json(
+                {
+                    "server": self.descriptor.server_name,
+                    "tool": self.descriptor.tool_name,
+                    "full_name": self.name,
+                    "result": result,
+                }
+            )
+        except Exception as exc:
+            self.emit(f"tool> {self.name} error {exc}")
+            self.tool_finished(self.name, ok=False)
+            return self.as_json({"error": str(exc)})
+
+
 class MrAppleSession:
     def __init__(
         self,
@@ -856,6 +967,9 @@ class MrAppleSession:
         *,
         mode: str = "chat",
         stream_mode: bool = False,
+        mcp_config_path: Optional[Path] = None,
+        session_store_dir: Optional[Path] = None,
+        session_name: Optional[str] = None,
         status_printer: Optional[Callable[[], None]] = None,
         event_sink: Optional[Callable[[str], None]] = None,
     ):
@@ -864,6 +978,11 @@ class MrAppleSession:
         self.mode = mode
         self.stream_mode = stream_mode
         self.user_facts: dict[str, str] = {}
+        self.mcp_config_path = mcp_config_path.expanduser().resolve() if mcp_config_path else None
+        if session_store_dir is None:
+            session_store_dir = self.context.workspace_root / ".mr_apple" / "sessions"
+        self.session_store_dir = session_store_dir.expanduser().resolve()
+        self.session_name = normalize_session_name(session_name) if session_name else None
 
         self.status = RuntimeStatus(
             RuntimeStats(
@@ -879,6 +998,10 @@ class MrAppleSession:
         self.model: Optional[fm.SystemLanguageModel] = None
         self.session: Optional[fm.LanguageModelSession] = None
         self.tools: list[fm.Tool] = []
+        self.mcp_manager: Optional[MCPManager] = None
+        self._restored_turns: list[dict[str, str]] = []
+        self._run_turns: list[dict[str, str]] = []
+        self._started = False
 
     def set_status_hooks(
         self,
@@ -888,9 +1011,13 @@ class MrAppleSession:
     ) -> None:
         self.context.status_printer = status_printer
         self.context.event_sink = event_sink
+        if self.mcp_manager:
+            self.mcp_manager.event_sink = event_sink if self.context.trace else None
 
     def set_trace(self, enabled: bool) -> None:
         self.context.trace = enabled
+        if self.mcp_manager:
+            self.mcp_manager.event_sink = self.context.event_sink if enabled else None
 
     def set_mode(self, mode: str) -> None:
         if mode not in {"chat", "agent"}:
@@ -906,17 +1033,110 @@ class MrAppleSession:
         if self.context.status_printer:
             self.context.status_printer()
 
+    def _session_file_path(self, name: str) -> Path:
+        safe_name = normalize_session_name(name)
+        return self.session_store_dir / f"{safe_name}.json"
+
+    def list_saved_sessions(self) -> list[str]:
+        if not self.session_store_dir.exists():
+            return []
+        names: list[str] = []
+        for path in sorted(self.session_store_dir.glob("*.json")):
+            names.append(path.stem)
+        return names
+
+    def session_exists(self, name: str) -> bool:
+        return self._session_file_path(name).exists()
+
+    def set_session_name(self, name: str) -> str:
+        normalized = normalize_session_name(name)
+        self.session_name = normalized
+        return normalized
+
+    async def _ensure_mcp_manager(self) -> None:
+        if not self.mcp_config_path:
+            self.mcp_manager = None
+            return
+        if self.mcp_manager is None:
+            self.mcp_manager = MCPManager(
+                self.mcp_config_path,
+                request_timeout_seconds=self.context.command_timeout_seconds,
+                event_sink=self.context.event_sink if self.context.trace else None,
+            )
+        await self.mcp_manager.start()
+
+    def _build_mcp_tools(self) -> list[fm.Tool]:
+        if not self.mcp_manager:
+            return []
+        return [
+            MCPProxyTool(self.context, self.mcp_manager, descriptor)
+            for descriptor in self.mcp_manager.tool_descriptors()
+        ]
+
+    def mcp_server_status_lines(self) -> list[str]:
+        if not self.mcp_manager:
+            return ["MCP disabled"]
+        statuses = self.mcp_manager.server_statuses()
+        if not statuses:
+            return ["No MCP servers loaded"]
+        lines: list[str] = []
+        for status in statuses:
+            if status.connected:
+                lines.append(f"{status.name}: connected tools={status.tool_count}")
+            else:
+                lines.append(f"{status.name}: error={status.error}")
+        return lines
+
+    def mcp_tool_lines(self) -> list[str]:
+        if not self.mcp_manager:
+            return []
+        lines = []
+        for descriptor in self.mcp_manager.tool_descriptors():
+            lines.append(
+                f"{descriptor.full_name} -> {descriptor.server_name}/{descriptor.tool_name}"
+            )
+        return lines
+
+    async def reload_mcp(self) -> None:
+        if not self.mcp_config_path:
+            raise RuntimeError("MCP is not configured; pass --mcp-config")
+
+        combined_history = self._combined_history()
+        await self._ensure_mcp_manager()
+        await self.initialize_session()
+        if combined_history:
+            self._restored_turns = combined_history[-DEFAULT_MAX_RESUME_TURNS:]
+            self._run_turns = []
+            await self._prime_restored_history()
+        await self.refresh_context_usage()
+
+    def _combined_history(self) -> list[dict[str, str]]:
+        return [*self._restored_turns, *self._run_turns]
+
     def _session_instructions(self) -> str:
+        tool_lines = [
+            "- run_command(command, cwd?, timeout_seconds?) for shell commands",
+            "- read_file(path, max_chars?) for reading UTF-8 files",
+            "- write_file(path, content, mode?) for writing/appending UTF-8 files",
+            "- list_files(path?, recursive?, max_entries?) for file discovery",
+            "- search_files(pattern, path?, max_matches?) for code/text search",
+            "- spawn_subagents(tasks, max_agents?) for parallel independent subtasks",
+        ]
+        if self.mcp_manager and self.mcp_manager.tool_descriptors():
+            tool_lines.append(
+                "- MCP tools are prefixed with 'mcp_<server>__<tool>' "
+                "and accept arguments_json (a JSON object string)."
+            )
+            for descriptor in self.mcp_manager.tool_descriptors():
+                tool_lines.append(
+                    f"- {descriptor.full_name}: MCP {descriptor.server_name}/{descriptor.tool_name}"
+                )
+
         return (
             f"{self.instructions}\n\n"
             f"Tool workspace root: {self.context.workspace_root}\n"
             "You have these callable tools:\n"
-            "- run_command(command, cwd?, timeout_seconds?) for shell commands\n"
-            "- read_file(path, max_chars?) for reading UTF-8 files\n"
-            "- write_file(path, content, mode?) for writing/appending UTF-8 files\n"
-            "- list_files(path?, recursive?, max_entries?) for file discovery\n"
-            "- search_files(pattern, path?, max_matches?) for code/text search\n"
-            "- spawn_subagents(tasks, max_agents?) for parallel independent subtasks\n"
+            f"{chr(10).join(tool_lines)}\n"
             "Do not call tools for simple greetings, chit-chat, or pure conversational memory "
             "questions that can be answered from session context.\n"
             "When tool output has an error, summarize it and propose next action.\n"
@@ -976,7 +1196,38 @@ class MrAppleSession:
             f"{user_prompt}"
         )
 
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+
+        if self.session_name and self.session_exists(self.session_name):
+            await self.load_named_session(self.session_name)
+            return
+
+        await self.initialize_session()
+        await self.refresh_context_usage()
+
+    async def _prime_restored_history(self) -> None:
+        if not self._restored_turns or not self.session:
+            return
+
+        tail = self._restored_turns[-DEFAULT_MAX_RESUME_TURNS:]
+        history_blob = json.dumps(tail, ensure_ascii=False)
+        prompt = (
+            "Internal restore operation. Do not call tools.\n"
+            "Use this prior conversation history to restore memory for future turns.\n"
+            "History JSON (user/assistant turns):\n"
+            f"{history_blob}\n\n"
+            "Reply with exactly: restored"
+        )
+        try:
+            await self.session.respond(prompt)
+        except Exception:
+            pass
+
     async def initialize_session(self) -> None:
+        await self._ensure_mcp_manager()
         self.model = fm.SystemLanguageModel()
         is_available, reason = self.model.is_available()
         if not is_available:
@@ -986,14 +1237,23 @@ class MrAppleSession:
         self.status.clear_context_overflow()
         self.status.set_context_chars(0)
 
-        self.tools = [
+        base_tools: list[fm.Tool] = [
             RunCommandTool(self.context),
             ReadFileTool(self.context),
             WriteFileTool(self.context),
             ListFilesTool(self.context),
             SearchFilesTool(self.context),
-            SpawnSubagentsTool(self.context, self.model, self.instructions),
         ]
+        mcp_tools = self._build_mcp_tools()
+        base_tools.append(
+            SpawnSubagentsTool(
+                self.context,
+                self.model,
+                self.instructions,
+                extra_tools_factory=self._build_mcp_tools if mcp_tools else None,
+            )
+        )
+        self.tools = [*base_tools, *mcp_tools]
         self.session = fm.LanguageModelSession(
             instructions=self._session_instructions(),
             model=self.model,
@@ -1042,8 +1302,14 @@ class MrAppleSession:
             else:
                 response = await self.session.respond(prompt)
 
+            self._run_turns.append({"user": user_input, "assistant": response})
             self.status.note_turn()
             await self.refresh_context_usage()
+            if self.session_name:
+                try:
+                    await self.save_named_session(self.session_name, include_transcript=False)
+                except Exception:
+                    pass
             return response
         except fm.FoundationModelsError as exc:
             if isinstance(exc, fm.ExceededContextWindowSizeError):
@@ -1089,9 +1355,93 @@ class MrAppleSession:
         await self.refresh_context_usage()
         return output_path
 
-    async def reset_session(self) -> None:
+    async def reset_session(self, *, clear_saved_context: bool = True) -> None:
+        if clear_saved_context:
+            self._restored_turns = []
+            self._run_turns = []
+            self.user_facts = {}
         await self.initialize_session()
         await self.refresh_context_usage()
+
+    async def save_named_session(
+        self,
+        name: Optional[str] = None,
+        *,
+        include_transcript: bool = True,
+    ) -> Path:
+        if name:
+            normalized = self.set_session_name(name)
+        elif self.session_name:
+            normalized = self.session_name
+        else:
+            raise ValueError("session name is required")
+
+        self.session_store_dir.mkdir(parents=True, exist_ok=True)
+        path = self._session_file_path(normalized)
+        payload: dict[str, Any] = {
+            "version": 1,
+            "name": normalized,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "workspace_root": str(self.context.workspace_root),
+            "cwd": str(self.context.cwd),
+            "mode": self.mode,
+            "stream_mode": self.stream_mode,
+            "user_facts": self.user_facts,
+            "history": self._combined_history(),
+        }
+        if include_transcript and self.session:
+            try:
+                payload["transcript"] = await self.session.transcript.to_dict()
+            except Exception:
+                pass
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    async def load_named_session(self, name: str) -> Path:
+        normalized = self.set_session_name(name)
+        path = self._session_file_path(normalized)
+        if not path.exists():
+            raise FileNotFoundError(f"session '{normalized}' not found")
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("invalid session file format")
+
+        self._restored_turns = _session_history_from_payload(payload)
+        self._run_turns = []
+        loaded_facts = payload.get("user_facts")
+        if isinstance(loaded_facts, dict):
+            self.user_facts = {str(k): str(v) for k, v in loaded_facts.items()}
+
+        loaded_mode = payload.get("mode")
+        if loaded_mode in {"chat", "agent"}:
+            self.mode = loaded_mode
+        loaded_stream = payload.get("stream_mode")
+        if isinstance(loaded_stream, bool):
+            self.stream_mode = loaded_stream
+
+        loaded_cwd = payload.get("cwd")
+        if isinstance(loaded_cwd, str) and loaded_cwd.strip():
+            try:
+                self.change_cwd(loaded_cwd)
+            except Exception:
+                self.context.cwd = self.context.workspace_root
+        else:
+            self.context.cwd = self.context.workspace_root
+
+        await self.initialize_session()
+        await self._prime_restored_history()
+        await self.refresh_context_usage()
+        return path
+
+    def session_summary(self) -> str:
+        name = self.session_name or "-"
+        history_len = len(self._combined_history())
+        return f"name={name} saved_turns={history_len} dir={self.session_store_dir}"
+
+    async def shutdown(self) -> None:
+        if self.mcp_manager:
+            await self.mcp_manager.close()
 
     def tool_descriptions(self) -> list[str]:
         return [f"{tool.name}: {tool.description}" for tool in self.tools]

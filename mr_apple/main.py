@@ -70,6 +70,29 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CONTEXT_WINDOW_CHARS,
         help="Approximate context window size used for status percentage.",
     )
+    parser.add_argument(
+        "--mcp-config",
+        type=Path,
+        help=(
+            "Path to MCP server config (standard JSON with top-level 'mcpServers'). "
+            "If omitted, uses <workspace>/.mr_apple/mcp_servers.json when present."
+        ),
+    )
+    parser.add_argument(
+        "--session-store-dir",
+        type=Path,
+        help=(
+            "Directory for saved named sessions. "
+            "Default: <workspace>/.mr_apple/sessions"
+        ),
+    )
+    parser.add_argument(
+        "--session",
+        help=(
+            "Named session to auto-resume at startup when it exists. "
+            "If it does not exist, this name becomes the active session name."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -96,11 +119,20 @@ def main() -> None:
             context_window_chars=args.context_window_chars,
             trace=args.trace,
         )
+        mcp_config_path = args.mcp_config
+        if mcp_config_path is None:
+            default_mcp = workspace_root / ".mr_apple" / "mcp_servers.json"
+            if default_mcp.exists():
+                mcp_config_path = default_mcp
+
         runtime = MrAppleSession(
             context=context,
             instructions=args.instructions,
             mode=args.mode,
             stream_mode=args.stream,
+            mcp_config_path=mcp_config_path,
+            session_store_dir=args.session_store_dir,
+            session_name=args.session,
         )
 
         if args.ui == "cli":
