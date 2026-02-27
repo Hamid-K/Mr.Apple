@@ -167,6 +167,8 @@ class MrAppleTextualApp(App[None]):
             await self._handle_input(text)
         finally:
             event.input.disabled = False
+            # Keep keyboard flow uninterrupted after each assistant turn/command.
+            self.call_later(event.input.focus)
 
     async def _handle_input(self, text: str) -> None:
         if text.startswith("/"):
