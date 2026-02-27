@@ -33,6 +33,7 @@ DEFAULT_MAX_SUBAGENTS = 4
 DEFAULT_CONTEXT_WINDOW_CHARS = 120_000
 DEFAULT_MAX_RESUME_TURNS = 24
 DEFAULT_OVERFLOW_RECOVERY_TURNS = 6
+DEFAULT_MCP_COMPACT_TOOL_THRESHOLD = 20
 DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS = 3
 DEFAULT_MCP_CONNECT_TIMEOUT_SECONDS = 8
 
@@ -77,11 +78,6 @@ class RuntimeStatus:
     def note_context_overflow(self) -> None:
         self.stats.context_overflow_count += 1
         self.stats.context_overflow_active = True
-        if (
-            self.stats.context_chars > 0
-            and self.stats.context_window_chars > self.stats.context_chars
-        ):
-            self.stats.context_window_chars = self.stats.context_chars
         self.stats.last_event = "context:overflow"
 
     def clear_context_overflow(self) -> None:
@@ -909,6 +905,47 @@ class MCPToolCallArgs:
     )
 
 
+def _package_mcp_result(
+    context: ToolRuntimeContext,
+    emit: Callable[[str], None],
+    tool_label: str,
+    result: Any,
+) -> tuple[dict[str, Any], bool]:
+    is_error = bool(result.get("isError")) if isinstance(result, dict) else False
+    serialization_fallback = False
+    try:
+        result_json = json.dumps(result, ensure_ascii=False)
+    except TypeError:
+        result_json = json.dumps({"result_repr": repr(result)}, ensure_ascii=False)
+        serialization_fallback = True
+    result_char_count = len(result_json)
+    result_truncated = result_char_count > context.output_char_limit
+    if result_truncated:
+        preview, _ = _truncate(result_json, context.output_char_limit)
+        emit(
+            f"tool> {tool_label} result truncated chars={result_char_count} "
+            f"limit={context.output_char_limit}"
+        )
+        safe_result: Any = {
+            "truncated": True,
+            "original_char_count": result_char_count,
+            "preview_json": preview,
+        }
+    else:
+        safe_result = {"result_repr": repr(result)} if serialization_fallback else result
+
+    return (
+        {
+            "result": safe_result,
+            "result_char_count": result_char_count,
+            "result_truncated": result_truncated,
+            "result_serialization_fallback": serialization_fallback,
+            "is_error": is_error,
+        },
+        is_error,
+    )
+
+
 class MCPProxyTool(WorkspaceToolBase):
     def __init__(
         self,
@@ -920,14 +957,21 @@ class MCPProxyTool(WorkspaceToolBase):
         self.descriptor = descriptor
         self.name = descriptor.full_name
 
-        schema_preview = json.dumps(descriptor.input_schema, ensure_ascii=False)
-        schema_preview, schema_truncated = _truncate(schema_preview, 500)
-        if schema_truncated:
-            schema_preview = f"{schema_preview}…"
-        base_desc = descriptor.description or "MCP tool"
+        base_desc = re.sub(r"\s+", " ", (descriptor.description or "MCP tool")).strip()
+        base_desc, desc_truncated = _truncate(base_desc, 180)
+        if desc_truncated:
+            base_desc = f"{base_desc}…"
+        key_preview = ""
+        properties = descriptor.input_schema.get("properties")
+        if isinstance(properties, dict):
+            keys = [str(item) for item in properties.keys()][:6]
+            if keys:
+                suffix = "…" if len(properties.keys()) > len(keys) else ""
+                key_preview = f" Keys: {', '.join(keys)}{suffix}."
         self.description = (
             f"[MCP:{descriptor.server_name}] {base_desc}. "
-            f"Provide arguments_json matching schema: {schema_preview}"
+            "arguments_json must be a JSON object."
+            f"{key_preview}"
         )
         super().__init__(context)
 
@@ -960,31 +1004,178 @@ class MCPProxyTool(WorkspaceToolBase):
                 f"tool> {self.name} done server={self.descriptor.server_name} "
                 f"tool={self.descriptor.tool_name} is_error={is_error}"
             )
-            result_json = json.dumps(result, ensure_ascii=False)
-            result_char_count = len(result_json)
-            result_truncated = result_char_count > self.context.output_char_limit
-            if result_truncated:
-                preview, _ = _truncate(result_json, self.context.output_char_limit)
-                self.emit(
-                    f"tool> {self.name} result truncated chars={result_char_count} "
-                    f"limit={self.context.output_char_limit}"
-                )
-                safe_result: Any = {
-                    "truncated": True,
-                    "original_char_count": result_char_count,
-                    "preview_json": preview,
-                }
-            else:
-                safe_result = result
-            self.tool_finished(self.name, ok=not is_error)
+            packaged, packaged_error = _package_mcp_result(
+                self.context, self.emit, self.name, result
+            )
+            self.tool_finished(self.name, ok=not packaged_error)
             return self.as_json(
                 {
                     "server": self.descriptor.server_name,
                     "tool": self.descriptor.tool_name,
                     "full_name": self.name,
-                    "result": safe_result,
-                    "result_char_count": result_char_count,
-                    "result_truncated": result_truncated,
+                    **packaged,
+                }
+            )
+        except Exception as exc:
+            self.emit(f"tool> {self.name} error {exc}")
+            self.tool_finished(self.name, ok=False)
+            return self.as_json({"error": str(exc)})
+
+
+@fm.generable("Arguments for listing loaded MCP tools.")
+class ListMCPToolsArgs:
+    server: Optional[str] = fm.guide("Optional MCP server name filter.")
+    max_entries: Optional[int] = fm.guide(
+        "Maximum number of tools to return.", range=(1, 500)
+    )
+
+
+class ListMCPToolsTool(WorkspaceToolBase):
+    name = "list_mcp_tools"
+    description = "Lists loaded MCP tools so you can choose one for call_mcp_tool."
+
+    def __init__(self, context: ToolRuntimeContext, mcp_manager: MCPManager):
+        self.mcp_manager = mcp_manager
+        super().__init__(context)
+
+    @property
+    def arguments_schema(self) -> fm.GenerationSchema:
+        return ListMCPToolsArgs.generation_schema()
+
+    async def call(self, args: fm.GeneratedContent) -> str:
+        server = args.value(Optional[str], for_property="server")
+        max_entries = args.value(Optional[int], for_property="max_entries") or 200
+        max_entries = max(1, min(int(max_entries), 500))
+        server_filter = server.strip() if isinstance(server, str) else ""
+
+        self.tool_started(self.name)
+        try:
+            tools = self.mcp_manager.tool_descriptors()
+            if server_filter:
+                tools = [item for item in tools if item.server_name == server_filter]
+
+            items: list[dict[str, Any]] = []
+            for descriptor in tools[:max_entries]:
+                desc = re.sub(r"\s+", " ", (descriptor.description or "")).strip()
+                desc, truncated = _truncate(desc, 120)
+                if truncated:
+                    desc = f"{desc}…"
+                items.append(
+                    {
+                        "full_name": descriptor.full_name,
+                        "server": descriptor.server_name,
+                        "tool": descriptor.tool_name,
+                        "description": desc,
+                    }
+                )
+            is_truncated = len(tools) > max_entries
+            self.tool_finished(self.name, ok=True)
+            return self.as_json(
+                {
+                    "server_filter": server_filter or None,
+                    "count": len(items),
+                    "total_available": len(tools),
+                    "truncated": is_truncated,
+                    "tools": items,
+                }
+            )
+        except Exception as exc:
+            self.tool_finished(self.name, ok=False)
+            return self.as_json({"error": str(exc)})
+
+
+@fm.generable("Arguments for calling a loaded MCP tool by name.")
+class CallMCPToolByNameArgs:
+    full_name: str = fm.guide(
+        "MCP tool name. Prefer full_name like 'mcp_ghidra__list_functions'. "
+        "You can also use 'server/tool' or a unique tool name."
+    )
+    arguments_json: Optional[str] = fm.guide(
+        "JSON object string with arguments for the MCP tool. Use '{}' when there are no arguments."
+    )
+
+
+class CallMCPToolByNameTool(WorkspaceToolBase):
+    name = "call_mcp_tool"
+    description = (
+        "Calls one loaded MCP tool by full_name. "
+        "Use list_mcp_tools first if needed."
+    )
+
+    def __init__(self, context: ToolRuntimeContext, mcp_manager: MCPManager):
+        self.mcp_manager = mcp_manager
+        super().__init__(context)
+
+    @property
+    def arguments_schema(self) -> fm.GenerationSchema:
+        return CallMCPToolByNameArgs.generation_schema()
+
+    def _resolve_full_name(self, raw_name: str) -> tuple[Optional[str], Optional[str]]:
+        requested = raw_name.strip()
+        if not requested:
+            return None, "full_name is required"
+
+        descriptors = self.mcp_manager.tool_descriptors()
+        exact = [item.full_name for item in descriptors if item.full_name == requested]
+        if exact:
+            return exact[0], None
+
+        if "/" in requested:
+            server_name, tool_name = requested.split("/", 1)
+            slash_matches = [
+                item.full_name
+                for item in descriptors
+                if item.server_name == server_name and item.tool_name == tool_name
+            ]
+            if len(slash_matches) == 1:
+                return slash_matches[0], None
+            if len(slash_matches) > 1:
+                return None, f"ambiguous MCP tool name '{requested}'"
+
+        tool_matches = [item.full_name for item in descriptors if item.tool_name == requested]
+        if len(tool_matches) == 1:
+            return tool_matches[0], None
+        if len(tool_matches) > 1:
+            return None, (
+                f"ambiguous tool '{requested}'. Use full_name like "
+                "'mcp_<server>__<tool>' or 'server/tool'."
+            )
+
+        return None, f"unknown MCP tool '{requested}'"
+
+    async def call(self, args: fm.GeneratedContent) -> str:
+        full_name = args.value(str, for_property="full_name")
+        raw_args = args.value(Optional[str], for_property="arguments_json")
+        self.tool_started(self.name)
+
+        try:
+            resolved_name, resolve_error = self._resolve_full_name(full_name)
+            if resolve_error:
+                self.tool_finished(self.name, ok=False)
+                return self.as_json({"error": resolve_error})
+            assert resolved_name is not None
+
+            if raw_args and raw_args.strip():
+                parsed = json.loads(raw_args)
+            else:
+                parsed = {}
+            if not isinstance(parsed, dict):
+                self.tool_finished(self.name, ok=False)
+                return self.as_json(
+                    {"error": "arguments_json must decode to a JSON object"}
+                )
+
+            self.emit(f"tool> {self.name} start target={resolved_name}")
+            result = await self.mcp_manager.call_tool(resolved_name, parsed)
+            packaged, is_error = _package_mcp_result(
+                self.context, self.emit, f"{self.name}:{resolved_name}", result
+            )
+            self.emit(f"tool> {self.name} done target={resolved_name} is_error={is_error}")
+            self.tool_finished(self.name, ok=not is_error)
+            return self.as_json(
+                {
+                    "full_name": resolved_name,
+                    **packaged,
                 }
             )
         except Exception as exc:
@@ -1036,6 +1227,7 @@ class MrAppleSession:
         self.mcp_last_error: Optional[str] = None
         self._restored_turns: list[dict[str, str]] = []
         self._run_turns: list[dict[str, str]] = []
+        self._compact_context_mode = False
         self._started = False
 
     def set_status_hooks(
@@ -1229,9 +1421,23 @@ class MrAppleSession:
                 await self.mcp_manager.close()
             self.mcp_manager = None
 
+    def _use_compact_mcp_toolset(self) -> bool:
+        if not self.mcp_manager:
+            return False
+        descriptor_count = len(self.mcp_manager.tool_descriptors())
+        return (
+            self._compact_context_mode
+            or descriptor_count > DEFAULT_MCP_COMPACT_TOOL_THRESHOLD
+        )
+
     def _build_mcp_tools(self) -> list[fm.Tool]:
         if not self.mcp_manager:
             return []
+        if self._use_compact_mcp_toolset():
+            return [
+                ListMCPToolsTool(self.context, self.mcp_manager),
+                CallMCPToolByNameTool(self.context, self.mcp_manager),
+            ]
         return [
             MCPProxyTool(self.context, self.mcp_manager, descriptor)
             for descriptor in self.mcp_manager.tool_descriptors()
@@ -1290,14 +1496,32 @@ class MrAppleSession:
             "- search_files(pattern, path?, max_matches?) for code/text search",
             "- spawn_subagents(tasks, max_agents?) for parallel independent subtasks",
         ]
-        if self.mcp_manager and self.mcp_manager.tool_descriptors():
-            tool_lines.append(
-                "- MCP tools are prefixed with 'mcp_<server>__<tool>' "
-                "and accept arguments_json (a JSON object string)."
-            )
-            for descriptor in self.mcp_manager.tool_descriptors():
+        mcp_descriptors = (
+            self.mcp_manager.tool_descriptors() if self.mcp_manager else []
+        )
+        if mcp_descriptors:
+            server_names = sorted({item.server_name for item in mcp_descriptors})
+            server_text = ", ".join(server_names)
+            if self._use_compact_mcp_toolset():
                 tool_lines.append(
-                    f"- {descriptor.full_name}: MCP {descriptor.server_name}/{descriptor.tool_name}"
+                    "- MCP compact mode is active to preserve context window."
+                )
+                tool_lines.append(
+                    "- Use list_mcp_tools(server?, max_entries?) to discover tools."
+                )
+                tool_lines.append(
+                    "- Use call_mcp_tool(full_name, arguments_json) to invoke one."
+                )
+                tool_lines.append(
+                    f"- Loaded MCP tools: {len(mcp_descriptors)} across servers: {server_text}."
+                )
+            else:
+                tool_lines.append(
+                    "- MCP tools are prefixed with 'mcp_<server>__<tool>' "
+                    "and accept arguments_json (a JSON object string)."
+                )
+                tool_lines.append(
+                    f"- Loaded MCP tools: {len(mcp_descriptors)} across servers: {server_text}."
                 )
 
         return (
@@ -1375,18 +1599,35 @@ class MrAppleSession:
 
     async def _compact_after_overflow(self) -> bool:
         combined_history = self._combined_history()
-        if not combined_history:
+        keep_turns = 0
+        did_compact_history = False
+        if combined_history:
+            keep_turns = min(DEFAULT_OVERFLOW_RECOVERY_TURNS, len(combined_history))
+            self._restored_turns = combined_history[-keep_turns:]
+            self._run_turns = []
+            did_compact_history = True
+
+        enabled_compact_mode = not self._compact_context_mode
+        self._compact_context_mode = True
+        if not did_compact_history and not enabled_compact_mode:
             return False
 
-        keep_turns = min(DEFAULT_OVERFLOW_RECOVERY_TURNS, len(combined_history))
-        self._restored_turns = combined_history[-keep_turns:]
-        self._run_turns = []
         if self.context.event_sink:
+            history_message = (
+                f"compacting to last {keep_turns} turns and "
+                if did_compact_history
+                else ""
+            )
+            mode_message = (
+                "enabling compact MCP tool mode and " if enabled_compact_mode else ""
+            )
             self.context.event_sink(
-                f"info> context overflow detected; compacting to last {keep_turns} turns and retrying once"
+                "info> context overflow detected; "
+                f"{mode_message}{history_message}retrying once"
             )
         await self.initialize_session()
-        await self._prime_restored_history()
+        if did_compact_history:
+            await self._prime_restored_history()
         await self.refresh_context_usage()
         return True
 

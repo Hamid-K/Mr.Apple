@@ -176,6 +176,10 @@ All built-in filesystem tools are restricted to the configured workspace root.
 - Status bar tracks estimated context usage and marks overflow with `OVERFLOW`.
 - On context overflow, Mr.Apple automatically compacts history and retries once.
 - MCP tool payloads are size-limited before being returned to the model to reduce overflow risk.
+- When many MCP tools are loaded, Mr.Apple automatically switches to compact MCP mode:
+  - `list_mcp_tools` for discovery
+  - `call_mcp_tool` for invocation
+  - This keeps context size low and avoids immediate overflow.
 
 ## Notes
 
