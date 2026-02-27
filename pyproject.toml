@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mr-apple"
+version = "0.1.0"
+description = "Terminal coding assistant for Apple's Foundation Models SDK"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Hamid K" }]
+license = { text = "MIT" }
+dependencies = [
+  "apple-fm-sdk>=0.1.0",
+  "textual>=0.60.0",
+  "rich>=13.7.0",
+]
+
+[project.scripts]
+mr-apple = "mr_apple.main:main"
+
+[tool.setuptools.packages.find]
+include = ["mr_apple*"]
