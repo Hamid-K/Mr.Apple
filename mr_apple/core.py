@@ -1194,7 +1194,14 @@ class MrAppleSession:
             )
             self.mcp_last_error = None
         except Exception as exc:
-            self.mcp_last_error = str(exc)
+            if isinstance(exc, asyncio.TimeoutError):
+                message = (
+                    "MCP startup timed out after "
+                    f"{DEFAULT_MCP_CONNECT_TIMEOUT_SECONDS}s"
+                )
+            else:
+                message = str(exc).strip() or exc.__class__.__name__
+            self.mcp_last_error = message
             if self.context.event_sink:
                 self.context.event_sink(
                     f"mcp> startup failed, continuing without MCP: {self.mcp_last_error}"

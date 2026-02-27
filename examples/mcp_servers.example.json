@@ -13,6 +13,15 @@
       "args": [
         "mcp-server-git"
       ]
+    },
+    "ghidra": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://localhost:8888/mcp"
+      ],
+      "stdio_mode": "ndjson"
     }
   }
 }

@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+STDIO_MODE_CONTENT_LENGTH = "content-length"
+STDIO_MODE_NDJSON = "ndjson"
 
 
 class MCPError(RuntimeError):
@@ -39,6 +41,7 @@ class _MCPServerConfig:
     args: list[str]
     env: dict[str, str]
     cwd: Optional[Path]
+    stdio_mode: str
 
 
 def _sanitize_name(raw: str) -> str:
@@ -49,6 +52,24 @@ def _sanitize_name(raw: str) -> str:
     if cleaned[0].isdigit():
         cleaned = f"_{cleaned}"
     return cleaned
+
+
+def _normalize_stdio_mode(raw: Any) -> str:
+    text = str(raw or "").strip().lower().replace("_", "-")
+    if text in {"ndjson", "jsonl", "json-lines", "newline", "line"}:
+        return STDIO_MODE_NDJSON
+    if text in {"content-length", "framed", "lsp"}:
+        return STDIO_MODE_CONTENT_LENGTH
+    return ""
+
+
+def _looks_like_mcp_remote(command: str, args: list[str]) -> bool:
+    candidates = [Path(command).name.lower()]
+    candidates.extend(Path(item).name.lower() for item in args)
+    for token in candidates:
+        if token == "mcp-remote" or token.startswith("mcp-remote@"):
+            return True
+    return False
 
 
 def _parse_mcp_config(config_path: Path) -> list[_MCPServerConfig]:
@@ -75,6 +96,14 @@ def _parse_mcp_config(config_path: Path) -> list[_MCPServerConfig]:
 
         args = [str(item) for item in spec.get("args", [])]
         env = {k: str(v) for k, v in spec.get("env", {}).items()}
+        configured_stdio_mode = _normalize_stdio_mode(
+            spec.get("stdio_mode") or spec.get("stdioMode")
+        )
+        stdio_mode = configured_stdio_mode or (
+            STDIO_MODE_NDJSON
+            if _looks_like_mcp_remote(command, args)
+            else STDIO_MODE_CONTENT_LENGTH
+        )
 
         cwd: Optional[Path] = None
         if spec.get("cwd"):
@@ -87,6 +116,7 @@ def _parse_mcp_config(config_path: Path) -> list[_MCPServerConfig]:
                 args=[os.path.expandvars(item) for item in args],
                 env={key: os.path.expandvars(value) for key, value in env.items()},
                 cwd=cwd,
+                stdio_mode=stdio_mode,
             )
         )
 
@@ -194,6 +224,28 @@ class _MCPStdioClient:
             self._fail_pending(exc)
 
     async def _read_message(self) -> Optional[dict[str, Any]]:
+        if self.config.stdio_mode == STDIO_MODE_NDJSON:
+            return await self._read_ndjson_message()
+        return await self._read_content_length_message()
+
+    async def _read_ndjson_message(self) -> Optional[dict[str, Any]]:
+        assert self.process is not None
+        assert self.process.stdout is not None
+        reader = self.process.stdout
+
+        while True:
+            line = await reader.readline()
+            if line == b"":
+                return None
+            decoded = line.decode("utf-8", errors="replace").strip()
+            if not decoded:
+                continue
+            parsed = json.loads(decoded)
+            if not isinstance(parsed, dict):
+                raise MCPError("Expected JSON-RPC object")
+            return parsed
+
+    async def _read_content_length_message(self) -> Optional[dict[str, Any]]:
         assert self.process is not None
         assert self.process.stdout is not None
         reader = self.process.stdout
@@ -284,7 +336,10 @@ class _MCPStdioClient:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         )
-        frame = f"Content-Length: {len(data)}\r\n\r\n".encode("ascii") + data
+        if self.config.stdio_mode == STDIO_MODE_NDJSON:
+            frame = data + b"\n"
+        else:
+            frame = f"Content-Length: {len(data)}\r\n\r\n".encode("ascii") + data
         async with self._write_lock:
             self.process.stdin.write(frame)
             await self.process.stdin.drain()
@@ -319,6 +374,11 @@ class _MCPStdioClient:
                 future,
                 timeout=self.request_timeout_seconds,
             )
+        except asyncio.TimeoutError as exc:
+            raise MCPError(
+                f"Timed out waiting for '{method}' response from server "
+                f"{self.config.name} after {self.request_timeout_seconds}s"
+            ) from exc
         finally:
             self._pending.pop(request_id, None)
 

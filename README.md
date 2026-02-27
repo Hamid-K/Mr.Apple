@@ -79,6 +79,7 @@ If `my-task` exists in the session store, it is resumed automatically.
 ## MCP Support (Standard Protocol)
 
 `Mr.Apple` supports standard MCP stdio servers using a config file with top-level `mcpServers`.
+For remote MCP over HTTP/SSE/Streamable HTTP, use a stdio bridge such as `mcp-remote`.
 
 Example `mcp_servers.json`:
 
@@ -96,10 +97,25 @@ Example `mcp_servers.json`:
     "git": {
       "command": "uvx",
       "args": ["mcp-server-git"]
+    },
+    "ghidra": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://localhost:8888/mcp"
+      ],
+      "stdio_mode": "ndjson"
     }
   }
 }
 ```
+
+`stdio_mode` is optional:
+- `content-length` (default for regular stdio servers)
+- `ndjson` (recommended for `mcp-remote`)
+
+`Mr.Apple` auto-detects `mcp-remote` and uses `ndjson` automatically when `stdio_mode` is omitted.
 
 Run with MCP config:
 
