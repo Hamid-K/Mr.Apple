@@ -32,6 +32,7 @@ DEFAULT_MAX_SEARCH_MATCHES = 100
 DEFAULT_MAX_SUBAGENTS = 4
 DEFAULT_CONTEXT_WINDOW_CHARS = 120_000
 DEFAULT_MAX_RESUME_TURNS = 24
+DEFAULT_OVERFLOW_RECOVERY_TURNS = 6
 DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS = 3
 DEFAULT_MCP_CONNECT_TIMEOUT_SECONDS = 8
 
@@ -959,13 +960,31 @@ class MCPProxyTool(WorkspaceToolBase):
                 f"tool> {self.name} done server={self.descriptor.server_name} "
                 f"tool={self.descriptor.tool_name} is_error={is_error}"
             )
+            result_json = json.dumps(result, ensure_ascii=False)
+            result_char_count = len(result_json)
+            result_truncated = result_char_count > self.context.output_char_limit
+            if result_truncated:
+                preview, _ = _truncate(result_json, self.context.output_char_limit)
+                self.emit(
+                    f"tool> {self.name} result truncated chars={result_char_count} "
+                    f"limit={self.context.output_char_limit}"
+                )
+                safe_result: Any = {
+                    "truncated": True,
+                    "original_char_count": result_char_count,
+                    "preview_json": preview,
+                }
+            else:
+                safe_result = result
             self.tool_finished(self.name, ok=not is_error)
             return self.as_json(
                 {
                     "server": self.descriptor.server_name,
                     "tool": self.descriptor.tool_name,
                     "full_name": self.name,
-                    "result": result,
+                    "result": safe_result,
+                    "result_char_count": result_char_count,
+                    "result_truncated": result_truncated,
                 }
             )
         except Exception as exc:
@@ -1343,6 +1362,34 @@ class MrAppleSession:
         lines = [f"- {k}: {v}" for k, v in self.user_facts.items()]
         return "\n".join(lines)
 
+    def _context_overflow_message(self, retried: bool) -> str:
+        if retried:
+            return (
+                "Context window exceeded even after automatic history compaction. "
+                "Use /reset or narrow the request/tool output size and retry."
+            )
+        return (
+            "Context window exceeded. "
+            "Use /reset or narrow the request/tool output size and retry."
+        )
+
+    async def _compact_after_overflow(self) -> bool:
+        combined_history = self._combined_history()
+        if not combined_history:
+            return False
+
+        keep_turns = min(DEFAULT_OVERFLOW_RECOVERY_TURNS, len(combined_history))
+        self._restored_turns = combined_history[-keep_turns:]
+        self._run_turns = []
+        if self.context.event_sink:
+            self.context.event_sink(
+                f"info> context overflow detected; compacting to last {keep_turns} turns and retrying once"
+            )
+        await self.initialize_session()
+        await self._prime_restored_history()
+        await self.refresh_context_usage()
+        return True
+
     def decorate_prompt(self, user_prompt: str) -> str:
         facts = self._facts_block()
         facts_section = f"Known user facts:\n{facts}\n\n" if facts else ""
@@ -1447,41 +1494,55 @@ class MrAppleSession:
 
         self._ingest_user_facts(user_input)
         prompt = self.decorate_prompt(user_input)
+        retried_after_overflow = False
 
-        try:
-            if self.stream_mode:
-                previous = ""
-                full_response = ""
-                async for snapshot in self.session.stream_response(prompt):
-                    full_response = snapshot
-                    if stream_callback:
-                        if snapshot.startswith(previous):
-                            delta = snapshot[len(previous) :]
-                        else:
-                            delta = snapshot
-                        if delta:
-                            stream_callback(delta)
-                    previous = snapshot
-                response = full_response
-            else:
-                response = await self.session.respond(prompt)
+        while True:
+            try:
+                if self.stream_mode:
+                    previous = ""
+                    full_response = ""
+                    async for snapshot in self.session.stream_response(prompt):
+                        full_response = snapshot
+                        if stream_callback:
+                            if snapshot.startswith(previous):
+                                delta = snapshot[len(previous) :]
+                            else:
+                                delta = snapshot
+                            if delta:
+                                stream_callback(delta)
+                        previous = snapshot
+                    response = full_response
+                else:
+                    response = await self.session.respond(prompt)
 
-            self._run_turns.append({"user": user_input, "assistant": response})
-            self.status.note_turn()
-            await self.refresh_context_usage()
-            if self.session_name:
-                try:
-                    await self.save_named_session(self.session_name, include_transcript=False)
-                except Exception:
-                    pass
-            return response
-        except fm.FoundationModelsError as exc:
-            if isinstance(exc, fm.ExceededContextWindowSizeError):
+                self._run_turns.append({"user": user_input, "assistant": response})
+                self.status.note_turn()
+                await self.refresh_context_usage()
+                if self.session_name:
+                    try:
+                        await self.save_named_session(
+                            self.session_name,
+                            include_transcript=False,
+                        )
+                    except Exception:
+                        pass
+                return response
+            except fm.ExceededContextWindowSizeError as exc:
                 self.status.note_context_overflow()
-            raise
-        except Exception:
-            await self.refresh_context_usage()
-            raise
+                if not retried_after_overflow:
+                    retried_after_overflow = await self._compact_after_overflow()
+                    if retried_after_overflow:
+                        prompt = self.decorate_prompt(user_input)
+                        continue
+                await self.refresh_context_usage()
+                raise fm.FoundationModelsError(
+                    self._context_overflow_message(retried_after_overflow)
+                ) from exc
+            except fm.FoundationModelsError:
+                raise
+            except Exception:
+                await self.refresh_context_usage()
+                raise
 
     async def run_shell(self, command: str) -> dict[str, Any]:
         return await _run_shell_command(

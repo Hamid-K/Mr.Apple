@@ -174,6 +174,8 @@ All built-in filesystem tools are restricted to the configured workspace root.
 - Session context is preserved across prompts until `/reset`.
 - Named sessions persist user/assistant history and user facts.
 - Status bar tracks estimated context usage and marks overflow with `OVERFLOW`.
+- On context overflow, Mr.Apple automatically compacts history and retries once.
+- MCP tool payloads are size-limited before being returned to the model to reduce overflow risk.
 
 ## Notes
 
