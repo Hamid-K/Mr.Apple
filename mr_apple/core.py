@@ -22,6 +22,7 @@ DEFAULT_INSTRUCTIONS = (
     "You are Mr.Apple, a pragmatic terminal coding assistant running locally on "
     "Apple Foundation Models. "
     "You can call tools to inspect files, modify files, search code, and run shell commands. "
+    "When a user asks for execution or verification, execute via tools and return actual results. "
     "When a tool returns an error, explain it and choose the next best action."
 )
 DEFAULT_TIMEOUT_SECONDS = 60
@@ -1137,6 +1138,10 @@ class MrAppleSession:
             f"Tool workspace root: {self.context.workspace_root}\n"
             "You have these callable tools:\n"
             f"{chr(10).join(tool_lines)}\n"
+            "Capability guarantees:\n"
+            "- run_command executes real shell commands in the local environment.\n"
+            "- run_command may access network resources available to the host environment.\n"
+            "- You can run commands like git/curl/wget when those binaries are installed.\n"
             "Execution policy:\n"
             "- If the user asks you to inspect, verify, run, fetch, read, write, search, or otherwise act on the environment, use tools directly.\n"
             "- Do not respond with 'run this command yourself' when execution is possible through available tools.\n"
@@ -1153,14 +1158,16 @@ class MrAppleSession:
             return (
                 "Current mode: agent. "
                 "Use tools proactively, split work into independent subtasks when useful, "
-                "use spawn_subagents for parallel progress, and validate results."
+                "use spawn_subagents for parallel progress, and validate results. "
+                "Assume tool execution is available and prefer action over guidance-only replies."
             )
         return (
             "Current mode: chat. "
             "Prioritize concise conversational answers, but automatically call tools "
             "whenever shell/filesystem access is needed for accuracy or to fulfill "
             "the request. For greetings, chit-chat, or questions answerable from this "
-            "conversation memory, do not call tools."
+            "conversation memory, do not call tools. "
+            "For operational requests, execute via tools and return results."
         )
 
     def _ingest_user_facts(self, user_prompt: str) -> None:
@@ -1195,6 +1202,10 @@ class MrAppleSession:
             "Runtime context:\n"
             f"- workspace_root: {self.context.workspace_root}\n"
             f"- default_cwd: {self.context.cwd}\n\n"
+            "Runtime capabilities:\n"
+            "- Shell command execution is available through run_command.\n"
+            "- Filesystem read/write/search is available through tools.\n"
+            "- Network access is available through shell tools when host networking allows it.\n\n"
             f"{self.mode_policy()}\n\n"
             f"{facts_section}"
             "User request:\n"
