@@ -32,6 +32,8 @@ DEFAULT_MAX_SEARCH_MATCHES = 100
 DEFAULT_MAX_SUBAGENTS = 4
 DEFAULT_CONTEXT_WINDOW_CHARS = 120_000
 DEFAULT_MAX_RESUME_TURNS = 24
+DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS = 3
+DEFAULT_MCP_CONNECT_TIMEOUT_SECONDS = 8
 
 
 @dataclass
@@ -1012,6 +1014,7 @@ class MrAppleSession:
         self.session: Optional[fm.LanguageModelSession] = None
         self.tools: list[fm.Tool] = []
         self.mcp_manager: Optional[MCPManager] = None
+        self.mcp_last_error: Optional[str] = None
         self._restored_turns: list[dict[str, str]] = []
         self._run_turns: list[dict[str, str]] = []
         self._started = False
@@ -1166,15 +1169,39 @@ class MrAppleSession:
 
     async def _ensure_mcp_manager(self) -> None:
         if not self.mcp_config_path:
+            if self.mcp_manager:
+                await self.mcp_manager.close()
             self.mcp_manager = None
+            self.mcp_last_error = None
             return
+        request_timeout = max(
+            1,
+            min(
+                self.context.command_timeout_seconds,
+                DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS,
+            ),
+        )
         if self.mcp_manager is None:
             self.mcp_manager = MCPManager(
                 self.mcp_config_path,
-                request_timeout_seconds=self.context.command_timeout_seconds,
+                request_timeout_seconds=request_timeout,
                 event_sink=self.context.event_sink if self.context.trace else None,
             )
-        await self.mcp_manager.start()
+        try:
+            await asyncio.wait_for(
+                self.mcp_manager.start(),
+                timeout=DEFAULT_MCP_CONNECT_TIMEOUT_SECONDS,
+            )
+            self.mcp_last_error = None
+        except Exception as exc:
+            self.mcp_last_error = str(exc)
+            if self.context.event_sink:
+                self.context.event_sink(
+                    f"mcp> startup failed, continuing without MCP: {self.mcp_last_error}"
+                )
+            if self.mcp_manager:
+                await self.mcp_manager.close()
+            self.mcp_manager = None
 
     def _build_mcp_tools(self) -> list[fm.Tool]:
         if not self.mcp_manager:
@@ -1186,6 +1213,8 @@ class MrAppleSession:
 
     def mcp_server_status_lines(self) -> list[str]:
         if not self.mcp_manager:
+            if self.mcp_last_error:
+                return [f"MCP disabled: {self.mcp_last_error}"]
             return ["MCP disabled"]
         statuses = self.mcp_manager.server_statuses()
         if not statuses:
@@ -1214,6 +1243,8 @@ class MrAppleSession:
 
         combined_history = self._combined_history()
         await self._ensure_mcp_manager()
+        if self.mcp_last_error:
+            raise RuntimeError(f"MCP reload failed: {self.mcp_last_error}")
         await self.initialize_session()
         if combined_history:
             self._restored_turns = combined_history[-DEFAULT_MAX_RESUME_TURNS:]
