@@ -886,6 +886,51 @@ def _session_history_from_payload(payload: dict[str, Any]) -> list[dict[str, str
     return cleaned
 
 
+def _looks_like_execution_request(user_prompt: str) -> bool:
+    text = user_prompt.lower()
+    keywords = [
+        "run ",
+        "execute ",
+        "shell",
+        "terminal",
+        "command",
+        "git ",
+        "upstream",
+        "curl ",
+        "wget ",
+        "ls ",
+        "cat ",
+        "grep ",
+        "find ",
+        "python ",
+        "pip ",
+        "npm ",
+        "node ",
+        "cargo ",
+        "go ",
+        "make ",
+        "cmake ",
+    ]
+    return any(token in text for token in keywords)
+
+
+def _looks_like_capability_refusal(text: str) -> bool:
+    lowered = text.lower()
+    phrases = [
+        "i can't",
+        "i cannot",
+        "i do not have the capability",
+        "i don't have the capability",
+        "i'm unable to",
+        "beyond my capabilities",
+        "cannot execute",
+        "can't execute",
+        "cannot access",
+        "can't access",
+    ]
+    return any(phrase in lowered for phrase in phrases)
+
+
 @fm.generable("Arguments for calling an MCP tool through JSON arguments.")
 class MCPToolCallArgs:
     arguments_json: Optional[str] = fm.guide(
@@ -1186,12 +1231,21 @@ class MrAppleSession:
     def decorate_prompt(self, user_prompt: str) -> str:
         facts = self._facts_block()
         facts_section = f"Known user facts:\n{facts}\n\n" if facts else ""
+        force_tools = ""
+        if _looks_like_execution_request(user_prompt):
+            force_tools = (
+                "Execution directive:\n"
+                "- The user is asking for real execution or environment inspection.\n"
+                "- You MUST use available tools (especially run_command/read_file/list_files/search_files) when needed.\n"
+                "- Do NOT claim you cannot run commands or access the filesystem if a tool can do it.\n\n"
+            )
         return (
             "Runtime context:\n"
             f"- workspace_root: {self.context.workspace_root}\n"
             f"- default_cwd: {self.context.cwd}\n\n"
             f"{self.mode_policy()}\n\n"
             f"{facts_section}"
+            f"{force_tools}"
             "User request:\n"
             f"{user_prompt}"
         )
@@ -1283,6 +1337,7 @@ class MrAppleSession:
 
         self._ingest_user_facts(user_input)
         prompt = self.decorate_prompt(user_input)
+        tool_calls_before = self.status.stats.tool_calls
 
         try:
             if self.stream_mode:
@@ -1301,6 +1356,37 @@ class MrAppleSession:
                 response = full_response
             else:
                 response = await self.session.respond(prompt)
+
+            tool_calls_after = self.status.stats.tool_calls
+            used_tool = tool_calls_after > tool_calls_before
+            if (
+                _looks_like_execution_request(user_input)
+                and not used_tool
+                and _looks_like_capability_refusal(response)
+            ):
+                corrective_prompt = (
+                    "Correction: Your previous answer incorrectly claimed lack of capability.\n"
+                    "You do have tools available in this session.\n"
+                    "Re-answer the original user request now and call tools as needed.\n"
+                    "Do not provide generic refusal.\n\n"
+                    f"Original user request:\n{user_input}"
+                )
+                if self.stream_mode:
+                    previous = ""
+                    full_response = ""
+                    async for snapshot in self.session.stream_response(corrective_prompt):
+                        full_response = snapshot
+                        if stream_callback:
+                            if snapshot.startswith(previous):
+                                delta = snapshot[len(previous) :]
+                            else:
+                                delta = snapshot
+                            if delta:
+                                stream_callback(delta)
+                        previous = snapshot
+                    response = full_response
+                else:
+                    response = await self.session.respond(corrective_prompt)
 
             self._run_turns.append({"user": user_input, "assistant": response})
             self.status.note_turn()
